@@ -18,6 +18,10 @@ import time
 from pathlib import Path
 
 import torch
+torch.backends.cudnn.enabled = False
+
+print("cuDNN enabled:", torch.backends.cudnn.enabled)
+
 from transformers import AutoModel, AutoTokenizer
 
 MODEL_NAME = "baidu/Unlimited-OCR-2"
