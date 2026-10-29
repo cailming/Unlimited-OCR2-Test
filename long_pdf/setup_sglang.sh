@@ -91,7 +91,7 @@ echo "[setup] validating imports in the exact target interpreter ..."
 "${VENV_PYTHON}" - <<'PY'
 import sys
 import torch
-import fitz
+import pymupdf
 import requests
 import sglang
 
@@ -103,7 +103,7 @@ print("CUDA OK:", torch.cuda.is_available())
 print("cuDNN  :", torch.backends.cudnn.version())
 if torch.cuda.is_available():
     print("GPU    :", torch.cuda.get_device_name(0))
-print("PyMuPDF:", fitz.VersionBind)
+print("PyMuPDF:", pymupdf.VersionBind)
 print("requests:", requests.__version__)
 print("SGLang :", getattr(sglang, "__version__", "unknown"))
 PY
