@@ -20,13 +20,12 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import os
 import shutil
 import sys
 import time
 from pathlib import Path
 
-import fitz
+import pymupdf
 import requests
 from sglang.srt.sampling.custom_logit_processor import (
     DeepseekOCRNoRepeatNGramLogitProcessor,
@@ -104,7 +103,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def render_pdf(args: argparse.Namespace, image_dir: Path) -> tuple[list[Path], list[int]]:
-    doc = fitz.open(args.pdf)
+    doc = pymupdf.open(args.pdf)
     try:
         total = doc.page_count
         start = args.first_page - 1
@@ -114,7 +113,7 @@ def render_pdf(args: argparse.Namespace, image_dir: Path) -> tuple[list[Path], l
         stop = total if args.max_pages == 0 else min(total, start + args.max_pages)
         indexes = list(range(start, stop))
         image_dir.mkdir(parents=True, exist_ok=True)
-        matrix = fitz.Matrix(args.dpi / 72.0, args.dpi / 72.0)
+        matrix = pymupdf.Matrix(args.dpi / 72.0, args.dpi / 72.0)
         paths: list[Path] = []
 
         print(
