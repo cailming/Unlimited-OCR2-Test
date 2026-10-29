@@ -1,11 +1,166 @@
 # Unlimited-OCR2-Test
 
-用于在 **Ubuntu + NVIDIA RTX 3090 24GB** 上快速验证百度 **Unlimited OCR 2**（`baidu/Unlimited-OCR-2`）的 Transformers 推理。
+用于在 **Ubuntu + NVIDIA RTX 3090 24GB** 上测试百度 **Unlimited OCR 2**（`baidu/Unlimited-OCR-2`）。
+
+本仓库现在分成两条测试路径：
+
+1. **Transformers 快速验证**：确认模型能在 RTX 3090 上加载并完成单页/少量页面推理；
+2. **SGLang 长文档验证**：测试 Unlimited OCR 2 真正主打的几十页、100 页级 PDF / unlimited-horizon parsing。
 
 > 上游项目：`baidu/Unlimited-OCR`  
 > 模型：`baidu/Unlimited-OCR-2`
 
-## 1. 推荐环境
+---
+
+# A. 100 页级 PDF / 长文档测试（推荐重点测试）
+
+不要用 `test_ocr.py` 循环 100 次单页 OCR 来验证官方宣称的超长文档能力。
+
+官方 Unlimited OCR 2 对超长文档推荐使用定制版 **SGLang**：
+
+```text
+PDF
+ ↓
+按页渲染为图片
+ ↓
+整份文档作为 ONE logical request
+ ↓
+SGLang page-window scheduling
+ ↓
+窗口间复用 KV tail
+ ↓
+连续输出 <PAGE> 结果
+```
+
+仓库已经增加：
+
+```text
+long_pdf/
+├── README.md
+├── setup_sglang.sh
+├── start_server_3090.sh
+├── sitecustomize.py
+└── pdf_ocr.py
+```
+
+## A1. 安装长文档环境
+
+```bash
+git pull
+bash long_pdf/setup_sglang.sh
+```
+
+这里使用独立的：
+
+```text
+.venv-sglang/
+```
+
+不会复用前面 Transformers 的 `uocr2` conda 环境。
+
+官方定制 SGLang wheel 存在 Git LFS 中，因此如果机器没有 `git-lfs`，先执行：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git-lfs
+git lfs install
+```
+
+然后重新运行：
+
+```bash
+bash long_pdf/setup_sglang.sh
+```
+
+## A2. 启动 RTX 3090 长文档服务
+
+终端 1：
+
+```bash
+bash long_pdf/start_server_3090.sh
+```
+
+针对 24GB RTX 3090，默认采用偏保守参数：
+
+```text
+page window          = 4
+max running requests = 1
+mem fraction static  = 0.65
+max prefill tokens   = 1024
+CUDA graph           = disabled
+```
+
+另外，你当前机器已经确认存在 pip cuDNN 9.20 与系统 cuDNN 9.22 混装问题，因此这个启动脚本默认：
+
+```text
+UOCR_DISABLE_CUDNN=1
+```
+
+让 SGLang 的各个 worker 都绕过 cuDNN；CUDA / RTX 3090 仍然启用。
+
+以后系统 CUDA/cuDNN 清理完成后可以：
+
+```bash
+UOCR_DISABLE_CUDNN=0 bash long_pdf/start_server_3090.sh
+```
+
+## A3. 先跑 10 页
+
+终端 2：
+
+```bash
+source .venv-sglang/bin/activate
+
+python long_pdf/pdf_ocr.py /path/to/document.pdf \
+  --max-pages 10
+```
+
+## A4. 再跑 100 页
+
+```bash
+python long_pdf/pdf_ocr.py /path/to/your_100_page.pdf \
+  --max-pages 100
+```
+
+输出：
+
+```text
+output/long_pdf/<pdf-name>/
+├── raw_output.txt
+├── metadata.json
+└── pages/
+    ├── page_0001.md
+    ├── page_0002.md
+    ├── ...
+    └── page_0100.md
+```
+
+完整性重点看：
+
+```text
+page check : requested=100, <PAGE> markers=100, page files=100
+```
+
+更详细的参数、OOM 调整、300 DPI、gundam/base 模式说明见：
+
+```text
+long_pdf/README.md
+```
+
+---
+
+# B. Transformers 快速验证
+
+这一部分适合确认：
+
+- CUDA 是否工作；
+- 模型是否能下载；
+- 权重是否能加载进 RTX 3090；
+- 单页 / 少量页面接口是否工作。
+
+它**不是** 100 页 PDF 的正式验证路径。
+
+## B1. 推荐环境
 
 官方 README 当前给出的 Transformers 快速测试环境为：
 
@@ -17,36 +172,15 @@
 
 RTX 3090 支持 FP16/BF16，本项目默认使用 BF16。
 
-建议 Ubuntu 22.04 / 24.04，先确认 NVIDIA 驱动正常：
-
-```bash
-nvidia-smi
-```
-
-## 2. 创建 Python 环境
-
-推荐 conda：
+## B2. 创建环境
 
 ```bash
 conda create -n uocr2 python=3.10 -y
 conda activate uocr2
-```
 
-或者使用 venv：
-
-```bash
-python3.10 -m venv .venv
-source .venv/bin/activate
-```
-
-## 3. 安装依赖
-
-```bash
 pip install -U pip
 pip install -r requirements.txt
 ```
-
-> 注意：PyTorch 是否能直接安装成功取决于当前官方 wheel/你的 CUDA 环境。如果 `torch==2.13.0` 的默认 PyPI wheel 在你的机器上不可用，请按照 PyTorch 官方 CUDA wheel 安装方式先安装对应 CUDA 版本的 torch/torchvision，再安装其余依赖。
 
 检查：
 
@@ -61,9 +195,7 @@ if torch.cuda.is_available():
 PY
 ```
 
-## 4. 生成测试图片
-
-仓库自带一段生成测试图片的代码，不需要另外找图片：
+## B3. 生成测试图片
 
 ```bash
 python make_sample_image.py
@@ -75,53 +207,20 @@ python make_sample_image.py
 samples/sample_ocr.png
 ```
 
-## 5. 单页 OCR（RTX 3090 首先测试这个）
+## B4. 单页 OCR
 
 ```bash
 python test_ocr.py --image samples/sample_ocr.png
 ```
 
-默认：
-
-- 模型：`baidu/Unlimited-OCR-2`
-- dtype：BF16
-- GPU：CUDA
-- 输出目录：`output/single/`
-
-程序会打印：
-
-- Python / PyTorch / CUDA 版本
-- GPU 名称
-- 总显存 / 空闲显存
-- 模型加载后 allocated/reserved 显存
-- OCR 推理耗时
-- OCR 文本结果
-
-首次运行会自动从 Hugging Face 下载模型，因此需要能访问 `huggingface.co`。
-
-如果需要指定 HF 镜像，可自行配置环境变量，例如：
+如果需要 Hugging Face 镜像：
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
+python test_ocr.py --image samples/sample_ocr.png
 ```
 
-## 6. 测试自己的图片
-
-```bash
-python test_ocr.py --image /path/to/test.jpg
-```
-
-指定输出目录：
-
-```bash
-python test_ocr.py \
-  --image /path/to/test.jpg \
-  --output output/my_test
-```
-
-## 7. 多页 OCR
-
-Unlimited OCR 2 官方支持 `infer_multi()`，多页按顺序一次送入模型，可利用跨页上下文：
+## B5. 少量多页 OCR
 
 ```bash
 python test_ocr.py \
@@ -129,84 +228,26 @@ python test_ocr.py \
   --multi
 ```
 
-RTX 3090 只有 24GB 显存，因此建议先从 2 页开始测试，再逐步增加页数。
+几十页/100 页不要继续堆到 Transformers `infer_multi()`，改用上面的 `long_pdf/` SGLang 路径。
 
-## 8. BF16 / FP16
+---
 
-默认：
-
-```bash
-python test_ocr.py --image test.jpg --dtype bf16
-```
-
-如果 BF16 出现兼容性问题：
-
-```bash
-python test_ocr.py --image test.jpg --dtype fp16
-```
-
-## 9. RTX 3090 出现 CUDA OOM 时
-
-先看 GPU 是否被其他程序占用：
-
-```bash
-nvidia-smi
-```
-
-本项目会自动设置：
-
-```text
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-```
-
-仍然 OOM 时，按顺序尝试：
-
-1. 关闭其他占用 RTX 3090 的进程；
-2. 单页测试，不要一开始使用多页；
-3. 使用 `--dtype fp16`；
-4. 将超高分辨率图片缩小后再识别；
-5. 如果目标是几十页/上百页文档，改用官方推荐的 SGLang 服务化方案，而不是直接在 24GB 显卡上用 Transformers 一次塞入大量页面。
-
-## 10. 文件说明
+# 文件说明
 
 ```text
 Unlimited-OCR2-Test/
 ├── README.md
 ├── requirements.txt
-├── make_sample_image.py    # 生成测试图片
-├── test_ocr.py             # 单页 / 多页 OCR 测试程序
-├── samples/                # 运行 make_sample_image.py 后产生
-└── output/                 # OCR 输出目录
+├── make_sample_image.py
+├── test_ocr.py
+├── long_pdf/
+│   ├── README.md
+│   ├── setup_sglang.sh
+│   ├── start_server_3090.sh
+│   ├── sitecustomize.py
+│   └── pdf_ocr.py
+└── .gitignore
 ```
-
-## 11. 一次性跑通流程
-
-```bash
-git clone https://github.com/cailming/Unlimited-OCR2-Test.git
-cd Unlimited-OCR2-Test
-
-conda create -n uocr2 python=3.10 -y
-conda activate uocr2
-
-pip install -U pip
-pip install -r requirements.txt
-
-python make_sample_image.py
-python test_ocr.py --image samples/sample_ocr.png
-```
-
-如果最后能看到类似：
-
-```text
-GPU         : NVIDIA GeForce RTX 3090
-CUDA ready  : True
-...
-===== OCR RESULT =====
-...
-===== END RESULT =====
-```
-
-就说明 **Unlimited OCR 2 已经成功在 RTX 3090 上完成本地推理**。
 
 ## 参考
 
