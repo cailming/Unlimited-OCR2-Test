@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local virtual environments
+.venv/
+.venv-sglang/
+
+# Downloaded upstream repository / Git LFS assets
+.third_party/
+
+# Test inputs/outputs generated locally
+samples/
+output/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
