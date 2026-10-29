@@ -18,6 +18,13 @@ source "${VENV_DIR}/bin/activate"
 
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
+# 这台 3090 主机已经确认同时存在 pip cuDNN 9.20 与系统 cuDNN 9.22，
+# Transformers 测试会触发 CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH。
+# SGLang 有多个 worker，因此通过 sitecustomize 让每个 Python worker 都禁用 cuDNN。
+# CUDA/GPU 仍然启用。以后清理好系统 CUDA/cuDNN 后可设 UOCR_DISABLE_CUDNN=0。
+export UOCR_DISABLE_CUDNN="${UOCR_DISABLE_CUDNN:-1}"
+export PYTHONPATH="${ROOT_DIR}/long_pdf${PYTHONPATH:+:${PYTHONPATH}}"
+
 # Unlimited OCR 2 的长文档 page-window scheduling。
 # 3090 只有 24GB，所以默认从 4 页窗口开始；如果 OOM，可改成 2。
 PAGE_WINDOW="${UOCR_PAGE_WINDOW:-4}"
@@ -48,11 +55,12 @@ Max page tokens      : ${SGLANG_UOCR_MAX_PAGE_TOKENS}
 Mem fraction static  : ${MEM_FRACTION_STATIC}
 Max prefill tokens   : ${MAX_PREFILL_TOKENS}
 Tokenizer workers    : ${TOKENIZER_WORKERS}
+Disable cuDNN        : ${UOCR_DISABLE_CUDNN}
 Port                 : ${PORT}
 ========================================================================
 EOF
 
-# 对 24GB 卡先禁用 CUDA Graph，牺牲少量吞吐换更低显存峰值。
+# 对 24GB 卡先禁用 CUDA Graph，牺牲吞吐换更低显存峰值。
 # 如果后续确认显存充足，再按官方 README 打开 CUDA Graph 参数。
 python -m sglang.launch_server \
   --model-path baidu/Unlimited-OCR-2 \
