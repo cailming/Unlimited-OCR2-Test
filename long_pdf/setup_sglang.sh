@@ -7,6 +7,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 THIRD_PARTY_DIR="${ROOT_DIR}/.third_party/Unlimited-OCR"
 VENV_DIR="${ROOT_DIR}/.venv-sglang"
+VENV_PYTHON="${VENV_DIR}/bin/python"
 WHEEL_NAME="sglang-0.5.20.dev10+g8d62f5fb9c-py3-none-any.whl"
 
 if ! command -v git >/dev/null 2>&1; then
@@ -70,26 +71,31 @@ fi
 
 echo "[setup] wheel size: ${WHEEL_SIZE} bytes"
 
-if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+if [[ ! -x "${VENV_PYTHON}" ]]; then
   echo "[setup] creating isolated Python 3.10 environment: ${VENV_DIR}"
   uv venv --python 3.10 "${VENV_DIR}"
 fi
 
-# shellcheck disable=SC1091
-source "${VENV_DIR}/bin/activate"
-
-# Follow the upstream Unlimited OCR 2 SGLang setup.
+# IMPORTANT: always target the venv by absolute Python path. This avoids accidentally
+# installing packages into Conda base when the shell prompt shows both (.venv-sglang) and (base).
+echo "[setup] target python: ${VENV_PYTHON}"
 echo "[setup] installing customized SGLang ..."
-uv pip install "${WHEEL_PATH}"
-uv pip install "pymupdf==1.27.2.2" "fastokens==0.3.2" requests
+uv pip install --python "${VENV_PYTHON}" "${WHEEL_PATH}"
+uv pip install --python "${VENV_PYTHON}" \
+  "pymupdf==1.27.2.2" \
+  "fastokens==0.3.2" \
+  requests
 
 echo
-python - <<'PY'
+echo "[setup] validating imports in the exact target interpreter ..."
+"${VENV_PYTHON}" - <<'PY'
 import sys
 import torch
 import fitz
+import requests
 import sglang
 
+print("Python executable:", sys.executable)
 print("Python :", sys.version.split()[0])
 print("Torch  :", torch.__version__)
 print("CUDA   :", torch.version.cuda)
@@ -98,9 +104,11 @@ print("cuDNN  :", torch.backends.cudnn.version())
 if torch.cuda.is_available():
     print("GPU    :", torch.cuda.get_device_name(0))
 print("PyMuPDF:", fitz.VersionBind)
+print("requests:", requests.__version__)
 print("SGLang :", getattr(sglang, "__version__", "unknown"))
 PY
 
 echo
 echo "Environment ready."
+echo "Activate with: source ${VENV_DIR}/bin/activate"
 echo "Next: bash long_pdf/start_server_3090.sh"
