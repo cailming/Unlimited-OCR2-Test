@@ -30,8 +30,6 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 #   2. gcc-14 / g++-14
 #   3. gcc-13 / g++-13
 #   4. 当前 gcc / g++（仅当主版本 <= 14）
-#
-# NVCC_CCBIN 是 nvcc 官方支持的默认 host compiler 覆盖方式。
 HOST_GCC="${UOCR_HOST_GCC:-}"
 HOST_GXX="${UOCR_HOST_GXX:-}"
 
@@ -105,11 +103,14 @@ export SGLANG_UOCR_SHM_WRAP_MIN_MB=1
 export SGLANG_VLM_CACHE_SIZE_MB=0
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-# 24GB 显卡：把并发压到 1，并为激活值保留较多空间。
+# 24GB 显卡：并发压到 1；但 Unlimited OCR 2 当前 wheel 的 eager mode 有已知 bug，
+# 会出现 bbox/坐标循环，因此不能再使用 --disable-cuda-graph。
+# 百度维护者给出的临时 workaround 是 full CUDA Graph。
 MEM_FRACTION_STATIC="${UOCR_MEM_FRACTION_STATIC:-0.65}"
-MAX_PREFILL_TOKENS="${UOCR_MAX_PREFILL_TOKENS:-1024}"
+MAX_PREFILL_TOKENS="${UOCR_MAX_PREFILL_TOKENS:-2048}"
 TOKENIZER_WORKERS="${UOCR_TOKENIZER_WORKERS:-2}"
 PORT="${UOCR_PORT:-10000}"
+CUDA_GRAPH_CONFIG='{"prefill":{"backend":"full","full_prefill_max_req":4}}'
 
 NVCC_PATH="$(command -v nvcc || true)"
 NVCC_VERSION="unknown"
@@ -129,6 +130,7 @@ Mem fraction static  : ${MEM_FRACTION_STATIC}
 Max prefill tokens   : ${MAX_PREFILL_TOKENS}
 Tokenizer workers    : ${TOKENIZER_WORKERS}
 Disable cuDNN        : ${UOCR_DISABLE_CUDNN}
+CUDA Graph           : full (workaround for current UOCR2 eager-mode bug)
 NVCC                 : ${NVCC_PATH:-not found}
 NVCC version         : ${NVCC_VERSION}
 CC                   : ${CC}
@@ -140,8 +142,6 @@ Port                 : ${PORT}
 ========================================================================
 EOF
 
-# 对 24GB 卡先禁用 CUDA Graph，牺牲吞吐换更低显存峰值。
-# 如果后续确认显存充足，再按官方 README 打开 CUDA Graph 参数。
 python -m sglang.launch_server \
   --model-path baidu/Unlimited-OCR-2 \
   --served-model-name Unlimited-OCR-2 \
@@ -156,6 +156,12 @@ python -m sglang.launch_server \
   --allow-auto-truncate \
   --disable-radix-cache \
   --mm-preprocess-cache-size-mb 0 \
-  --disable-cuda-graph \
+  --cuda-graph \
+  --cuda-graph-backend-decode full \
+  --cuda-graph-max-bs-decode 4 \
+  --cuda-graph-backend-prefill full \
+  --cuda-graph-max-bs-prefill 16384 \
+  --cuda-graph-bs-prefill 1024 2048 \
+  --cuda-graph-config "${CUDA_GRAPH_CONFIG}" \
   --host 0.0.0.0 \
   --port "${PORT}"
