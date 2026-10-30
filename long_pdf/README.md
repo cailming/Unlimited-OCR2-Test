@@ -1,20 +1,27 @@
-# Unlimited OCR 2：100 页级 PDF 测试
+# Unlimited OCR 2：100 页 PDF 稳定读取
 
-这个目录用于测试 Unlimited OCR 2 真正主打的 **ultra-long / unlimited-horizon document parsing**，而不是简单的单页 OCR。
+当前在 RTX 3090 24GB 上，**优先推荐 Transformers 路径**。目标先收敛为：稳定把 100 页 PDF 识别出来并生成 Markdown；SGLang 长文档 serving 暂时保留为实验路径。
 
-官方 README 对超长文档推荐使用定制版 **SGLang**：PDF 转为按顺序排列的页面图片后，**整份文档作为一次请求**提交；服务端通过 page-window scheduling 分窗口处理，并复用上一窗口的 KV tail。
+百度官方 Unlimited OCR 2 同时支持：
 
-> 目标环境：Ubuntu + NVIDIA RTX 3090 24GB。
->
-> 3090 显存远小于官方常见的 A800-80GB 环境，因此这里默认优先“跑通”而不是追求并发和吞吐。
+- **Transformers**：原生 Python 推理，适合直接测试和离线处理；
+- **SGLang**：更适合高性能 serving、长文档调度和并发。
 
-## 目录
+本项目当前推荐先使用 Transformers，因为单页路径已经在 RTX 3090 上验证稳定，而当前定制 SGLang wheel 在长内容场景下仍遇到输出退化/停滞问题。
+
+---
+
+## 推荐方案：Transformers 逐页/小批量处理
+
+### 目录
 
 ```text
 long_pdf/
-├── setup_sglang.sh       # 创建独立 SGLang 环境并安装百度官方定制 wheel
-├── start_server_3090.sh  # 3090 24GB 的保守服务端参数
-└── pdf_ocr.py            # PDF -> 页面图 -> 单次长文档请求 -> 输出结果
+├── pdf_ocr_transformers.py  # 推荐：100 页 PDF 稳定读取
+├── setup_transformers.sh    # Transformers 长 PDF 依赖检查/补充
+├── pdf_ocr.py               # SGLang 长文档客户端（实验）
+├── setup_sglang.sh          # SGLang 环境（实验）
+└── start_server_3090.sh     # SGLang 服务端（实验）
 ```
 
 ## 1. 拉取最新代码
@@ -23,223 +30,242 @@ long_pdf/
 git pull
 ```
 
-## 2. 建立独立 SGLang 环境
-
-不要直接复用之前的 `uocr2` Transformers 环境。长文档测试使用单独的 `.venv-sglang`：
+## 2. 使用原来的 uocr2 Transformers 环境
 
 ```bash
-bash long_pdf/setup_sglang.sh
+conda activate uocr2
 ```
 
-脚本会：
-
-1. 拉取 `baidu/Unlimited-OCR` 官方仓库到 `.third_party/Unlimited-OCR`；
-2. 创建 Python 3.10 的 `.venv-sglang`；
-3. 安装官方仓库中的定制 SGLang wheel；
-4. 安装 `PyMuPDF`、`fastokens`、`requests`。
-
-## 3. 启动 3090 长文档服务
-
-终端 1：
+安装/检查 PDF 与官方后处理依赖：
 
 ```bash
-bash long_pdf/start_server_3090.sh
+bash long_pdf/setup_transformers.sh
 ```
 
-默认关键参数：
+脚本只补充 `PyMuPDF`，并把百度官方仓库拉到：
 
 ```text
-page window          = 4 pages
-max running requests = 1
-mem fraction static  = 0.65
-max prefill tokens   = 1024
-CUDA graph           = disabled
+.third_party/Unlimited-OCR/
 ```
 
-这不是官方吞吐最优配置，而是针对 RTX 3090 24GB 的第一版保守配置。
+用于调用官方：
 
-看到服务监听 `10000` 端口后，再开第二个终端运行客户端。
-
-### 如果服务端 OOM
-
-先把 page window 从 4 降到 2：
-
-```bash
-UOCR_PAGE_WINDOW=2 bash long_pdf/start_server_3090.sh
+```text
+utils/process_unlimitedOCR2.py
 ```
 
-还不够时进一步降低静态显存比例：
+把模型原始 `<PAGE>/<BLOCK>` 输出转换成 Markdown。
+
+## 3. 先关闭 SGLang，释放 3090 显存
+
+Transformers 运行时不要同时保留 SGLang scheduler。
 
 ```bash
-UOCR_PAGE_WINDOW=2 \
-UOCR_MEM_FRACTION_STATIC=0.60 \
-bash long_pdf/start_server_3090.sh
+fuser -k 10000/tcp || true
+nvidia-smi
 ```
 
-不要一开始就提高并发。我们的目标是先验证 100 页 PDF 能否完整跑通。
+如果 `nvidia-smi` 中还有旧的 Unlimited OCR Python 进程，确认用途后再结束，尽量给 Transformers 留出完整的 24GB 显存。
 
-## 4. 先测试 10 页
-
-终端 2：
+## 4. 先测试 3 页
 
 ```bash
-source .venv-sglang/bin/activate
-
-python long_pdf/pdf_ocr.py /path/to/document.pdf \
-  --max-pages 10
+python long_pdf/pdf_ocr_transformers.py test.pdf \
+  --max-pages 3
 ```
 
-默认会：
+默认配置：
 
-- 从第 1 页开始；
-- 220 DPI 渲染为 JPEG；
-- 使用 `gundam` 动态裁剪模式；
-- 把这 10 页作为 **一次请求**提交；
-- 流式打印 OCR 结果；
-- 把结果写入 `output/long_pdf/<pdf-name>/`。
+```text
+batch-pages = 1
+DPI         = 220
+retry DPI   = 180,150
+resume      = true
+```
 
-## 5. 正式测试 100 页 PDF
+也就是说默认采用最稳的方式：
+
+```text
+PDF
+ ↓
+第1页 -> model.infer() -> page_0001.md
+ ↓
+第2页 -> model.infer() -> page_0002.md
+ ↓
+第3页 -> model.infer() -> page_0003.md
+ ↓
+...
+ ↓
+合并 document.md
+```
+
+模型只加载一次，不会每页重新加载模型。
+
+## 5. 正式读取 100 页
 
 ```bash
-source .venv-sglang/bin/activate
-
-python long_pdf/pdf_ocr.py /path/to/your_100_page.pdf \
+python long_pdf/pdf_ocr_transformers.py test.pdf \
   --max-pages 100
 ```
 
-如果 PDF 本身刚好 100 页，也可以直接：
-
-```bash
-python long_pdf/pdf_ocr.py /path/to/your_100_page.pdf
-```
-
-输出结构：
+输出目录：
 
 ```text
-output/long_pdf/your_100_page/
-├── raw_output.txt
+output/transformers_pdf/test/
+├── document.md
 ├── metadata.json
-└── pages/
-    ├── page_0001.md
-    ├── page_0002.md
-    ├── ...
-    └── page_0100.md
+├── pages/
+│   ├── page_0001.md
+│   ├── page_0002.md
+│   └── ...
+├── raw/
+│   ├── page_0001.txt
+│   ├── page_0002.txt
+│   └── ...
+├── model_artifacts/
+└── errors/
 ```
 
-`raw_output.txt` 最重要：它保留模型原始 `<PAGE>` 输出。如果逐页拆分数量不对，先看这个文件。
-
-`metadata.json` 会记录：
-
-- 实际请求页数；
-- 原 PDF 页码；
-- DPI；
-- gundam/base 模式；
-- 最大输出 token；
-- `<PAGE>` marker 数；
-- 总耗时；
-- API usage（如果服务返回）。
-
-### 完整性判断
-
-100 页测试完成后，重点看最后一行：
+最终主要看：
 
 ```text
-page check : requested=100, <PAGE> markers=100, page files=100
+output/transformers_pdf/test/document.md
 ```
 
-理想情况下三者都应该是 100。
+## 6. 断点续跑
 
-## 6. 更接近官方示例：300 DPI
+默认启用 `--resume`。
 
-官方 README 的 PDF 示例使用 300 DPI。如果 220 DPI 已经跑通、显存和系统内存也够，可以测试：
+例如已经完成 1～37 页，第 38 页意外失败或手工 `Ctrl+C`，直接重新执行同一命令：
 
 ```bash
-python long_pdf/pdf_ocr.py /path/to/your_100_page.pdf \
+python long_pdf/pdf_ocr_transformers.py test.pdf \
+  --max-pages 100
+```
+
+已有的：
+
+```text
+pages/page_0001.md
+...
+pages/page_0037.md
+```
+
+会直接跳过，只处理缺失页。
+
+如果希望全部重新识别：
+
+```bash
+python long_pdf/pdf_ocr_transformers.py test.pdf \
   --max-pages 100 \
-  --dpi 300
+  --no-resume
 ```
 
-注意：300 DPI 会显著增大页面图片和 HTTP 请求体。100 页时 CPU 内存、网络/本机请求序列化开销也会明显增加。
+## 7. OOM 自动降 DPI
 
-## 7. gundam 与 base
+默认先使用：
 
-默认：
+```text
+220 DPI
+```
+
+如果某页出现 CUDA OOM，会依次尝试：
+
+```text
+180 DPI
+150 DPI
+```
+
+可以自行修改：
 
 ```bash
---mode gundam
-```
-
-对应：
-
-```python
-"images_config": {"crop_mode": True}
-```
-
-如果某份 PDF 页面非常多、图像很复杂或出现显存问题，可以测试 base：
-
-```bash
-python long_pdf/pdf_ocr.py /path/to/document.pdf \
+python long_pdf/pdf_ocr_transformers.py test.pdf \
   --max-pages 100 \
-  --mode base
+  --dpi 200 \
+  --retry-dpis 170,140
 ```
 
-`base` 每页使用全局视图，图像 token 压力通常更小，但细小文字的效果可能弱于动态裁剪。
+## 8. 后续再尝试小批量 infer_multi
 
-## 8. 从中间页开始测试
-
-例如测试第 101～200 页：
+当前优先稳定，所以默认：
 
 ```bash
-python long_pdf/pdf_ocr.py /path/to/book.pdf \
+--batch-pages 1
+```
+
+以后确认逐页 100 页稳定后，可尝试两页一组：
+
+```bash
+python long_pdf/pdf_ocr_transformers.py test.pdf \
+  --max-pages 100 \
+  --batch-pages 2
+```
+
+或四页一组：
+
+```bash
+python long_pdf/pdf_ocr_transformers.py test.pdf \
+  --max-pages 100 \
+  --batch-pages 4
+```
+
+`batch-pages > 1` 会调用官方 `model.infer_multi()`，可以利用组内跨页上下文，但会提高显存和长序列压力。
+
+对于当前 RTX 3090，建议先保持：
+
+```text
+batch-pages = 1
+```
+
+把 100 页完整读出来以后，再优化性能。
+
+## 9. 从中间页开始
+
+例如读取 101～200 页：
+
+```bash
+python long_pdf/pdf_ocr_transformers.py book.pdf \
   --first-page 101 \
   --max-pages 100
 ```
 
-## 9. 关于“Unlimited”的正确理解
+## 10. 为什么当前先不用 SGLang
 
-这里的“Unlimited”不是指 GPU 一次把 100 页全部展开进普通 attention context。
+SGLang 不是 Unlimited OCR 2 模型本身，而是高性能推理/服务框架，主要负责：
 
-Unlimited OCR 2 的关键是服务器端长文档调度：
+- HTTP serving；
+- 多请求调度；
+- KV cache；
+- CUDA Graph；
+- page-window 长文档调度；
+- 更高吞吐。
 
-```text
-100-page PDF
-    ↓
-100 ordered page images
-    ↓
-ONE logical request
-    ↓
-page window 1 (e.g. pages 1-4)
-    ↓ reuse KV tail
-page window 2 (pages 5-8)
-    ↓ reuse KV tail
-...
-    ↓
-page window 25 (pages 97-100)
-    ↓
-continuous <PAGE> output
-```
+这些能力对在线服务和高性能很有价值，但不是“读取 100 页 PDF”的必要条件。
 
-因此 **page window 可以很小，但整份 PDF 仍然是一个连续请求**。这才是我们要验证的能力。
-
-## 10. 3090 与官方宣传效果的区别
-
-代码路径与官方 SGLang 长文档方案一致，但 RTX 3090 只有 24GB 显存，因此不能预先保证能复现官方所有 benchmark 的速度、窗口大小或准确率。
-
-建议测试顺序：
+目前项目需求优先级调整为：
 
 ```text
-10 pages
-  ↓
-30 pages
-  ↓
-50 pages
-  ↓
-100 pages
+第一阶段：100 页稳定读取
+       ↓
+Transformers 单页 checkpoint
+       ↓
+第二阶段：2～4 页 infer_multi
+       ↓
+第三阶段：修复/升级 SGLang 后再测试整份长文档 serving
 ```
 
-每一级都确认：
+因此当前先把 `pdf_ocr_transformers.py` 作为主路径。
 
-1. 服务端没有 OOM；
-2. `<PAGE>` 数量与输入页数一致；
-3. 中间页和最后几页没有明显截断；
-4. 表格、段落、跨页内容的 Markdown 结构可接受。
+---
+
+## SGLang 实验路径
+
+原有文件仍保留：
+
+```text
+long_pdf/setup_sglang.sh
+long_pdf/start_server_3090.sh
+long_pdf/pdf_ocr.py
+```
+
+后续如果百度更新定制 SGLang wheel，或者需要测试真正的 page-window / KV-tail 跨页长文档能力，再继续使用这套路径。
