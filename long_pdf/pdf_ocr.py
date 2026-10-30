@@ -6,7 +6,8 @@ This follows the upstream SGLang path for ultra-long documents:
 2. Send all selected pages in ONE OpenAI-compatible request.
 3. Let the server-side Unlimited OCR 2 page-window scheduler reuse context
    between windows.
-4. Stream the raw response to disk and split <PAGE> sections into per-page files.
+4. Save the raw <PAGE>/<BLOCK> stream to disk.
+5. Run Baidu's official process_unlimitedOCR2.convert() to produce readable Markdown.
 
 Example:
     python long_pdf/pdf_ocr.py document.pdf --max-pages 100
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import importlib.util
 import json
 import shutil
 import sys
@@ -36,6 +38,10 @@ PAGE_TOKEN_ID = 128827
 EOS_TOKEN_ID = 1
 NGRAM_SIZE = 35
 NGRAM_PROCESSOR = DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
+ROOT_DIR = Path(__file__).resolve().parents[1]
+OFFICIAL_POSTPROCESSOR = (
+    ROOT_DIR / ".third_party" / "Unlimited-OCR" / "utils" / "process_unlimitedOCR2.py"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,6 +89,11 @@ def parse_args() -> argparse.Namespace:
         "--keep-images",
         action="store_true",
         help="keep rendered page JPEGs after the request",
+    )
+    p.add_argument(
+        "--show-raw",
+        action="store_true",
+        help="also print the raw <PAGE>/<BLOCK> stream to the terminal (very verbose)",
     )
     return p.parse_args()
 
@@ -183,6 +194,7 @@ def stream_request(args: argparse.Namespace, payload: dict, raw_path: Path) -> d
     session.trust_env = False
 
     print(f"[request] POST {url}")
+    print("[request] raw layout stream ->", raw_path)
     started = time.time()
     response = session.post(
         url,
@@ -198,6 +210,7 @@ def stream_request(args: argparse.Namespace, payload: dict, raw_path: Path) -> d
 
     usage = None
     chars = 0
+    next_progress = 10_000
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     with raw_path.open("w", encoding="utf-8") as out:
         for line in response.iter_lines(decode_unicode=True):
@@ -217,30 +230,67 @@ def stream_request(args: argparse.Namespace, payload: dict, raw_path: Path) -> d
                 out.write(delta)
                 out.flush()
                 chars += len(delta)
-                print(delta, end="", flush=True)
+                if args.show_raw:
+                    print(delta, end="", flush=True)
+                elif chars >= next_progress:
+                    print(f"[request] received {chars:,} raw chars ...")
+                    while next_progress <= chars:
+                        next_progress += 10_000
 
     elapsed = time.time() - started
-    print()
-    print(f"[request] completed in {elapsed:.1f}s, output chars={chars:,}")
+    if args.show_raw:
+        print()
+    print(f"[request] completed in {elapsed:.1f}s, raw chars={chars:,}")
     return {"elapsed_seconds": round(elapsed, 2), "output_chars": chars, "usage": usage}
 
 
-def split_pages(raw_path: Path, page_numbers: list[int], pages_dir: Path) -> tuple[int, int]:
+def split_raw_pages(raw_path: Path, page_numbers: list[int], raw_pages_dir: Path) -> tuple[int, int]:
+    """Split raw <PAGE> sections for diagnostics only; these are NOT Markdown."""
     text = raw_path.read_text(encoding="utf-8")
     marker_count = text.count("<PAGE>")
     chunks = text.split("<PAGE>")
     if chunks and not chunks[0].strip():
         chunks = chunks[1:]
 
-    pages_dir.mkdir(parents=True, exist_ok=True)
+    raw_pages_dir.mkdir(parents=True, exist_ok=True)
     written = 0
     for idx, chunk in enumerate(chunks[: len(page_numbers)]):
         page_no = page_numbers[idx]
-        target = pages_dir / f"page_{page_no:04d}.md"
-        target.write_text(chunk.lstrip("\n"), encoding="utf-8")
+        target = raw_pages_dir / f"page_{page_no:04d}.txt"
+        target.write_text("<PAGE>" + chunk.lstrip("\n"), encoding="utf-8")
         written += 1
 
     return marker_count, written
+
+
+def load_official_converter():
+    """Load Baidu's official utils/process_unlimitedOCR2.py from the cloned upstream repo."""
+    if not OFFICIAL_POSTPROCESSOR.is_file():
+        raise RuntimeError(
+            "Official postprocessor not found:\n"
+            f"  {OFFICIAL_POSTPROCESSOR}\n"
+            "Run: bash long_pdf/setup_sglang.sh"
+        )
+
+    spec = importlib.util.spec_from_file_location(
+        "uocr2_official_postprocess", OFFICIAL_POSTPROCESSOR
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load official postprocessor: {OFFICIAL_POSTPROCESSOR}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "convert"):
+        raise RuntimeError("Official process_unlimitedOCR2.py has no convert() function")
+    return module.convert
+
+
+def postprocess_to_markdown(raw_path: Path, markdown_path: Path) -> int:
+    """Convert the raw document stream to readable Markdown with Baidu's official converter."""
+    convert = load_official_converter()
+    raw = raw_path.read_text(encoding="utf-8", errors="ignore")
+    markdown = convert(raw)
+    markdown_path.write_text(markdown, encoding="utf-8")
+    return len(markdown)
 
 
 def main() -> None:
@@ -251,7 +301,8 @@ def main() -> None:
     run_dir = args.output_dir / run_name
     image_dir = run_dir / "rendered_pages"
     raw_path = run_dir / "raw_output.txt"
-    pages_dir = run_dir / "pages"
+    raw_pages_dir = run_dir / "raw_pages"
+    markdown_path = run_dir / "document.md"
     metadata_path = run_dir / "metadata.json"
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -268,7 +319,11 @@ def main() -> None:
 
     try:
         stats = stream_request(args, payload, raw_path)
-        marker_count, page_files = split_pages(raw_path, page_numbers, pages_dir)
+        marker_count, raw_page_files = split_raw_pages(raw_path, page_numbers, raw_pages_dir)
+
+        print("[postprocess] converting raw layout blocks with Baidu official converter ...")
+        markdown_chars = postprocess_to_markdown(raw_path, markdown_path)
+        print(f"[postprocess] Markdown chars={markdown_chars:,}")
 
         metadata = {
             "source_pdf": str(args.pdf.resolve()),
@@ -281,7 +336,9 @@ def main() -> None:
             "max_tokens": max_tokens,
             "max_page_tokens": args.max_page_tokens,
             "page_markers_in_output": marker_count,
-            "per_page_files_written": page_files,
+            "raw_page_files_written": raw_page_files,
+            "markdown_chars": markdown_chars,
+            "official_postprocessor": str(OFFICIAL_POSTPROCESSOR),
             **stats,
         }
         metadata_path.write_text(
@@ -290,12 +347,13 @@ def main() -> None:
 
         print("=" * 80)
         print("DONE")
+        print("Markdown   :", markdown_path)
         print("raw output :", raw_path)
-        print("page files :", pages_dir)
+        print("raw pages  :", raw_pages_dir)
         print("metadata   :", metadata_path)
         print(
             f"page check : requested={len(images)}, <PAGE> markers={marker_count}, "
-            f"page files={page_files}"
+            f"raw pages={raw_page_files}"
         )
         if marker_count != len(images):
             print(
