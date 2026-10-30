@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# RTX 3090 24GB 单卡保守启动参数。
-# 目标不是高并发，而是优先把 100 页级 PDF 跑通。
+# RTX 3090 24GB 单卡启动脚本。
+# 目标：优先跑通 Unlimited OCR 2 长文档，并规避当前 SGLang eager-mode bbox 循环问题。
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${ROOT_DIR}/.venv-sglang"
@@ -21,15 +21,7 @@ export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 # -----------------------------------------------------------------------------
 # CUDA 12.8 JIT host compiler
 # -----------------------------------------------------------------------------
-# SGLang 会在首次视觉推理时调用 nvcc JIT 编译 CUDA kernel。
-# CUDA 12.8 官方只支持 GCC <= 14；新 Ubuntu 的默认 gcc 可能已经是 15+，
-# 会导致：unsupported GNU version -> Failed to build JIT module -> scheduler 崩溃。
-#
-# 优先级：
-#   1. 用户显式指定 UOCR_HOST_GCC / UOCR_HOST_GXX
-#   2. gcc-14 / g++-14
-#   3. gcc-13 / g++-13
-#   4. 当前 gcc / g++（仅当主版本 <= 14）
+# CUDA 12.8 需要 GCC <= 14。优先使用 gcc-14/g++-14。
 HOST_GCC="${UOCR_HOST_GCC:-}"
 HOST_GXX="${UOCR_HOST_GXX:-}"
 
@@ -68,10 +60,6 @@ Install GCC 14 first:
 
   sudo apt-get update
   sudo apt-get install -y gcc-14 g++-14
-
-Then rerun:
-
-  bash long_pdf/start_server_3090.sh
 EOF
   exit 2
 fi
@@ -81,31 +69,24 @@ export CXX="${HOST_GXX}"
 export CUDAHOSTCXX="${HOST_GXX}"
 export NVCC_CCBIN="${HOST_GCC}"
 
-# 这台 3090 主机已经确认同时存在 pip cuDNN 9.20 与系统 cuDNN 9.22，
-# Transformers 测试会触发 CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH。
-# SGLang 有多个 worker，因此通过 sitecustomize 让每个 Python worker 都禁用 cuDNN。
-# CUDA/GPU 仍然启用。以后清理好系统 CUDA/cuDNN 后可设 UOCR_DISABLE_CUDNN=0。
+# 当前机器存在混合 cuDNN 库，默认通过 sitecustomize 禁用 cuDNN，CUDA 仍保持启用。
 export UOCR_DISABLE_CUDNN="${UOCR_DISABLE_CUDNN:-1}"
 export PYTHONPATH="${ROOT_DIR}/long_pdf${PYTHONPATH:+:${PYTHONPATH}}"
 
-# Unlimited OCR 2 的长文档 page-window scheduling。
-# 3090 只有 24GB，所以默认从 4 页窗口开始；如果 OOM，可改成 2。
+# -----------------------------------------------------------------------------
+# Unlimited OCR 2 long-document settings
+# -----------------------------------------------------------------------------
 PAGE_WINDOW="${UOCR_PAGE_WINDOW:-4}"
 export SGLANG_UOCR_EANABLE_DOC_LIMIT=1
 export SGLANG_UOCR_DOC_GUNDAM_PAGE_WINDOW="${PAGE_WINDOW}"
 export SGLANG_UOCR_DOC_BASE_PAGE_WINDOW="${PAGE_WINDOW}"
 export SGLANG_UOCR_MAX_PAGE_TOKENS="${UOCR_MAX_PAGE_TOKENS:-12000}"
-
-# 官方推荐的长文档内存保护开关。
 export SGLANG_OPT_UOCR_SAM_REL_POS_BIAS_MB="${UOCR_SAM_REL_POS_BIAS_MB:-64}"
 export SGLANG_UOCR_SHM_WRAP_MODEL_DATA=1
 export SGLANG_UOCR_SHM_WRAP_MIN_MB=1
 export SGLANG_VLM_CACHE_SIZE_MB=0
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-# 24GB 显卡：并发压到 1；但 Unlimited OCR 2 当前 wheel 的 eager mode 有已知 bug，
-# 会出现 bbox/坐标循环，因此不能再使用 --disable-cuda-graph。
-# 百度维护者给出的临时 workaround 是 full CUDA Graph。
 MEM_FRACTION_STATIC="${UOCR_MEM_FRACTION_STATIC:-0.65}"
 MAX_PREFILL_TOKENS="${UOCR_MAX_PREFILL_TOKENS:-2048}"
 TOKENIZER_WORKERS="${UOCR_TOKENIZER_WORKERS:-2}"
@@ -142,6 +123,8 @@ Port                 : ${PORT}
 ========================================================================
 EOF
 
+# 注意：当前安装的 SGLang CLI 没有独立的 --cuda-graph 开关。
+# CUDA Graph 默认未禁用；下面用 per-phase 参数显式指定 full backend。
 python -m sglang.launch_server \
   --model-path baidu/Unlimited-OCR-2 \
   --served-model-name Unlimited-OCR-2 \
@@ -156,7 +139,6 @@ python -m sglang.launch_server \
   --allow-auto-truncate \
   --disable-radix-cache \
   --mm-preprocess-cache-size-mb 0 \
-  --cuda-graph \
   --cuda-graph-backend-decode full \
   --cuda-graph-max-bs-decode 4 \
   --cuda-graph-backend-prefill full \
